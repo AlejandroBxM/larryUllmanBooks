@@ -1,0 +1,17 @@
+{
+    "name": "larry/ullman-books",
+    "description": "PHP project from Larry Ullman books",
+    "type": "project",
+    "require": {
+        "php": ">=7.4"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^9.5"
+    },
+    "autoload": {
+        "classmap": [
+            "includes/",
+            "classes/"
+        ]
+    }
+}
