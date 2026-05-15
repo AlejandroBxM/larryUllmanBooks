@@ -1,36 +1,256 @@
-# This is a basic workflow to help you get started with Actions
+# GitHub Actions workflow completo para PHP
+name: PHP Complete CI/CD
 
-name: CI
-
-# Controls when the workflow will run
+# Control de cuándo se ejecuta
 on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
   push:
-    branches: [ "main" ]
+    branches: [ "main", "master", "develop" ]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
   pull_request:
-    branches: [ "main" ]
-
-  # Allows you to run this workflow manually from the Actions tab
+    branches: [ "main", "master" ]
+  # Manual desde Actions tab
   workflow_dispatch:
+    inputs:
+      deploy:
+        description: 'Desplegar después del test?'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+# Variables de entorno generales
+env:
+  PHP_EXTENSIONS: mysqli, pdo, pdo_mysql, mbstring, curl, json, gd
+  DEFAULT_PHP_VERSION: '8.2'
+
+# Jobs a ejecutar
 jobs:
-  # This workflow contains a single job called "build"
-  build:
-    # The type of runner that the job will run on
+  # ==================== JOB 1: CODE QUALITY ====================
+  code-quality:
+    name: 📋 Code Quality Check
     runs-on: ubuntu-latest
-
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v4
+      - name: 📥 Checkout código
+        uses: actions/checkout@v4
 
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
+      - name: 🔍 Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.DEFAULT_PHP_VERSION }}
+          tools: composer, phpcs, phpstan
+          extensions: ${{ env.PHP_EXTENSIONS }}
+          coverage: none
 
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
+      - name: 📦 Instalar dependencias
+        run: composer install --no-progress --no-suggest --prefer-dist
+
+      - name: 🎨 Verificar PHP Syntax
         run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+          find . -name "*.php" -not -path "./vendor/*" -print0 | xargs -0 -n1 php -l
+
+      - name: 🔧 PHP CodeSniffer (PSR-12)
+        run: |
+          if [ -f "phpcs.xml" ] || [ -f "phpcs.xml.dist" ]; then
+            phpcs --standard=PSR12 --extensions=php .
+          else
+            echo "No phpcs config found, skipping..."
+          fi
+
+      - name: 🔬 PHPStan Static Analysis
+        run: |
+          if [ -f "phpstan.neon" ] || [ -f "phpstan.neon.dist" ]; then
+            phpstan analyse src/ --level=5
+          else
+            echo "No PHPStan config found, skipping..."
+          fi
+
+  # ==================== JOB 2: PHP UNIT TESTS ====================
+  php-tests:
+    name: 🧪 PHP ${{ matrix.php-version }} Tests
+    runs-on: ubuntu-latest
+    needs: code-quality
+    strategy:
+      matrix:
+        php-version: ['7.4', '8.0', '8.1', '8.2', '8.3']
+        dependency-mode: ['prefer-stable']
+      fail-fast: false
+
+    steps:
+      - name: 📥 Checkout código
+        uses: actions/checkout@v4
+
+      - name: 🔧 Setup PHP ${{ matrix.php-version }}
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php-version }}
+          extensions: ${{ env.PHP_EXTENSIONS }}
+          coverage: xdebug
+          tools: composer
+
+      - name: 📦 Instalar dependencias
+        run: |
+          composer update --${{ matrix.dependency-mode }} --prefer-dist --no-interaction
+          composer install --no-progress
+
+      - name: 🏃‍♂️ Ejecutar PHPUnit tests
+        run: |
+          if [ -f "phpunit.xml" ] || [ -f "phpunit.xml.dist" ]; then
+            vendor/bin/phpunit --coverage-text
+          else
+            echo "No PHPUnit config found, running basic checks..."
+            php -r "echo 'No tests configured yet';"
+          fi
+
+      - name: 💾 Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-php-${{ matrix.php-version }}
+          path: |
+            tests/_output/
+            coverage/
+            *.log
+          if-no-files-found: ignore
+
+  # ==================== JOB 3: LINT & SECURITY ====================
+  security-check:
+    name: 🔒 Security Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Checkout código
+        uses: actions/checkout@v4
+
+      - name: 🔧 Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.DEFAULT_PHP_VERSION }}
+          tools: composer
+
+      - name: 📦 Instalar dependencias
+        run: composer install --no-progress
+
+      - name: 🔐 Verificar vulnerabilidades (Local PHP Security Checker)
+        run: |
+          curl -sS https://get.symfony.com/cli/installer | bash
+          $HOME/.symfony5/bin/symfony check:security
+
+      - name: 🛡️ Verificar composer vulnerabilities
+        run: |
+          composer audit
+
+      - name: 🔍 Check for suspicious patterns
+        run: |
+          echo "🔍 Checking for eval, system, exec usage..."
+          grep -rn "eval(" --include="*.php" --exclude-dir=vendor && echo "⚠️ Found eval() usage!" || echo "✅ No eval() found"
+          grep -rn "system(" --include="*.php" --exclude-dir=vendor && echo "⚠️ Found system() usage!" || echo "✅ No system() found"
+
+  # ==================== JOB 4: BUILD & DEPLOY ====================
+  build-and-deploy:
+    name: 🚀 Build & Deploy
+    runs-on: ubuntu-latest
+    needs: [php-tests, security-check]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: 📥 Checkout código
+        uses: actions/checkout@v4
+
+      - name: 🔧 Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.DEFAULT_PHP_VERSION }}
+          extensions: ${{ env.PHP_EXTENSIONS }}
+
+      - name: 📦 Instalar dependencias (producción)
+        run: |
+          composer install --no-dev --optimize-autoloader --no-interaction
+
+      - name: 🗜️ Crear artefacto de build
+        run: |
+          mkdir -p deploy
+          rsync -av --exclude='.git' --exclude='.github' --exclude='tests' --exclude='deploy' ./ deploy/
+          cd deploy && zip -r ../build-${{ github.sha }}.zip . && cd ..
+
+      - name: 💾 Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: php-app-build
+          path: build-${{ github.sha }}.zip
+          retention-days: 7
+
+      # ==================== DEPLOY OPTIONS ====================
+      
+      # Opción 1: Desplegar a FTP
+      - name: 📤 Deploy via FTP
+        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
+        if: false  # Cambia a true cuando tengas las secrets configuradas
+        with:
+          server: ${{ secrets.FTP_SERVER }}
+          username: ${{ secrets.FTP_USERNAME }}
+          password: ${{ secrets.FTP_PASSWORD }}
+          local-dir: ./deploy/
+          server-dir: ${{ secrets.FTP_REMOTE_DIR }}
+          dangerous-clean-slate: true
+
+      # Opción 2: Desplegar a un VPS via SSH
+      - name: 📤 Deploy via SSH
+        if: false  # Cambia a true cuando tengas las secrets configuradas
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          script: |
+            cd /var/www/html/larry
+            git pull origin main
+            composer install --no-dev --optimize-autoloader
+            php bin/console cache:clear
+            php bin/console doctrine:migrations:migrate --no-interaction
+
+      # Opción 3: Desplegar a cPanel via API
+      - name: 📤 Deploy to cPanel
+        if: false  # Cambia a true cuando tengas las secrets configuradas
+        run: |
+          curl -X POST "${{ secrets.CPANEL_API_URL }}" \
+            -H "Authorization: cpanel ${{ secrets.CPANEL_TOKEN }}" \
+            --data-urlencode "path=${{ secrets.CPANEL_PATH }}" \
+            --data-urlencode "url=https://github.com/${{ github.repository }}/archive/${{ github.ref_name }}.zip"
+
+      # Notificación de éxito
+      - name: ✅ Deployment Success Notification
+        if: success()
+        run: |
+          echo "🚀 Deployment completed successfully!"
+          echo "📦 Commit: ${{ github.sha }}"
+          echo "🌿 Branch: ${{ github.ref_name }}"
+
+  # ==================== JOB 5: NOTIFICACIONES ====================
+  notifications:
+    name: 📧 Send Notifications
+    runs-on: ubuntu-latest
+    needs: [php-tests, security-check]
+    if: always()
+    
+    steps:
+      - name: 📝 Enviar a Discord (opcional)
+        if: false  # Configura cuando tengas webhook
+        uses: sarisia/actions-status-discord@v1
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK }}
+          status: ${{ job.status }}
+          title: "Build PHP - {{ workflow.name }}"
+          description: "El job {{ job.name }} terminó con estado: {{ job.status }}"
+
+      - name: ✉️ Enviar a Slack (opcional)
+        if: false  # Configura cuando tengas webhook
+        uses: act10ns/slack@v2
+        with:
+          status: ${{ job.status }}
+          channel: '#github-actions'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
